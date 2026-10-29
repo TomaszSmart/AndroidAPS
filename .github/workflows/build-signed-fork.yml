@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
-      contents: write   # needed to publish the APK as a GitHub Release
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -89,7 +89,7 @@ jobs:
         with:
           name: unsigned-apk-${{ env.VARIANT }}
           path: ${{ env.UNSIGNED_APK }}
-          retention-days: 7
+          retention-days: 1
 
       - name: Sign APK
         env:
@@ -117,20 +117,44 @@ jobs:
           "$BT/apksigner" verify --print-certs "$OUT" | grep -E "SHA-256|Verifies"
           rm -f "$RUNNER_TEMP/release.jks"
           echo "APK_NAME=$OUT" >> "$GITHUB_ENV"
-          echo "RELEASE_TAG=aaps-${VARIANT}-${LABEL}-$(date +%Y%m%d-%H%M)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
-      - name: Publish GitHub Release
+      # The signed APK is uploaded to the owner's Google Drive (secret GDRIVE_OAUTH2, same as aaps-ci).
+      # It is deliberately NOT published on the public Releases page or as a workflow artifact.
+      - name: Upload signed APK to Google Drive
         env:
-          GH_TOKEN: ${{ github.token }}
+          GDRIVE_OAUTH2: ${{ secrets.GDRIVE_OAUTH2 }}
         run: |
-          LATEST=""
-          [ "$VARIANT" = "fullRelease" ] && [ -z "$SOURCE_TAG" ] && LATEST="--latest"
-          TITLE="AAPS 4.0.0-rc1 + source trend arrow, $VARIANT (${GITHUB_SHA::7})"
-          [ -n "$SOURCE_TAG" ] && TITLE="Official AAPS $SOURCE_TAG, $VARIANT, signed with own key"
-          gh release create "$RELEASE_TAG" "$APK_NAME"             --target "$GITHUB_SHA"             --title "$TITLE"             --notes "Signed fork build ($VARIANT, ${LABEL}) from ${GITHUB_REF_NAME}, commit ${GITHUB_SHA}. Not an official AAPS build."             $LATEST
+          fail() { echo "::error::$1"; exit 1; }
+          [ -n "$GDRIVE_OAUTH2" ] || fail "Secret GDRIVE_OAUTH2 is missing"
+          DECODED=$(printf '%s' "$GDRIVE_OAUTH2" | base64 -d) || fail "GDRIVE_OAUTH2 is not valid base64"
+          CLIENT_ID=$(printf '%s' "$DECODED" | cut -d'|' -f1)
+          REFRESH_TOKEN=$(printf '%s' "$DECODED" | cut -d'|' -f2)
+          echo "::add-mask::$CLIENT_ID"; echo "::add-mask::$REFRESH_TOKEN"
+          TOKEN_RESPONSE=$(curl -s -X POST https://oauth2.googleapis.com/token             -d client_id="$CLIENT_ID" -d refresh_token="$REFRESH_TOKEN" -d grant_type=refresh_token)
+          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r .access_token)
+          [ -n "$ACCESS_TOKEN" ] && [ "$ACCESS_TOKEN" != "null" ] || fail "Could not get a Google access token (is GDRIVE_OAUTH2 still valid?)"
+          echo "::add-mask::$ACCESS_TOKEN"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.APK_NAME }}
-          path: ${{ env.APK_NAME }}
-          retention-days: 30
+          find_or_create_folder() {
+            NAME=$1; PARENT=$2
+            Q="name='${NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            [ -n "$PARENT" ] && Q="$Q and '${PARENT}' in parents"
+            ID=$(curl -s -G -H "Authorization: Bearer $ACCESS_TOKEN"               --data-urlencode "q=$Q" "https://www.googleapis.com/drive/v3/files" | jq -r '.files[0].id')
+            if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+              if [ -n "$PARENT" ]; then BODY="{\"name\":\"$NAME\",\"mimeType\":\"application/vnd.google-apps.folder\",\"parents\":[\"$PARENT\"]}"
+              else BODY="{\"name\":\"$NAME\",\"mimeType\":\"application/vnd.google-apps.folder\"}"; fi
+              ID=$(curl -s -X POST -H "Authorization: Bearer $ACCESS_TOKEN" -H "Content-Type: application/json"                 -d "$BODY" "https://www.googleapis.com/drive/v3/files" | jq -r '.id')
+            fi
+            echo "$ID"
+          }
+
+          AAPS_FOLDER_ID=$(find_or_create_folder "AAPS" "")
+          [ -n "$AAPS_FOLDER_ID" ] && [ "$AAPS_FOLDER_ID" != "null" ] || fail "Could not find or create the AAPS folder on Drive"
+          FOLDER_ID=$(find_or_create_folder "fork-builds" "$AAPS_FOLDER_ID")
+          [ -n "$FOLDER_ID" ] && [ "$FOLDER_ID" != "null" ] || fail "Could not create the fork-builds folder on Drive"
+
+          HTTP_CODE=$(curl -s -o /tmp/gdrive_response.json -w "%{http_code}" -X POST             -H "Authorization: Bearer $ACCESS_TOKEN"             -F "metadata={\"name\":\"$APK_NAME\", \"parents\":[\"$FOLDER_ID\"]};type=application/json;charset=UTF-8"             -F "file=@$APK_NAME;type=application/vnd.android.package-archive"             "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart")
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+            fail "Drive upload failed, HTTP $HTTP_CODE"
+          fi
+          echo "Uploaded $APK_NAME to Google Drive: AAPS/fork-builds"
