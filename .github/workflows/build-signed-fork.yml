@@ -9,11 +9,22 @@ name: Build signed AAPS (fork)
 
 on:
   workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Build variant (both are signed with the same key)'
+        required: true
+        default: 'fullRelease'
+        type: choice
+        options:
+          - fullRelease
+          - aapsclientRelease
   push:
     branches: [ native-trend-arrow ]
 
 env:
   JAVA_VERSION: 21
+  # push builds have no inputs, they build the full app
+  VARIANT: ${{ inputs.variant || 'fullRelease' }}
 
 jobs:
   trend-arrow-tests:
@@ -44,19 +55,20 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - run: chmod +x gradlew
 
-      - name: Build full release (unsigned)
-        run: ./gradlew :app:assembleFullRelease --stacktrace
+      - name: Build ${{ env.VARIANT }} (unsigned)
+        run: ./gradlew ":app:assemble${VARIANT^}" --stacktrace
 
       - name: Locate unsigned APK
         run: |
-          IN=$(find app/build/outputs -name '*.apk' | head -1)
+          FLAVOR=$(echo "$VARIANT" | sed -E 's/(Release|Debug)$//' | tr '[:upper:]' '[:lower:]')
+          IN=$(find "app/build/outputs/apk/$FLAVOR" -name '*.apk' | head -1)
           echo "Found APKs:"; find app/build/outputs -name '*.apk' -exec ls -l {} \;
-          if [ -z "$IN" ]; then echo "::error::No APK found under app/build/outputs"; exit 1; fi
+          if [ -z "$IN" ]; then echo "::error::No APK found for variant $VARIANT"; exit 1; fi
           echo "UNSIGNED_APK=$IN" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: unsigned-apk
+          name: unsigned-apk-${{ env.VARIANT }}
           path: ${{ env.UNSIGNED_APK }}
           retention-days: 7
 
@@ -78,23 +90,21 @@ jobs:
           echo "SDK=$SDK"; ls "$SDK/build-tools" || fail "no build-tools under $SDK"
           BT="$SDK/build-tools/$(ls "$SDK/build-tools" | sort -V | tail -1)"
           echo "BT=$BT"
-          OUT="AAPS-native-trend-arrow-$(date +%Y%m%d)-${GITHUB_SHA::7}.apk"
+          OUT="AAPS-${VARIANT}-native-trend-arrow-$(date +%Y%m%d)-${GITHUB_SHA::7}.apk"
           "$BT/zipalign" -p -f 4 "$UNSIGNED_APK" aligned.apk || fail "zipalign failed"
           "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks"             --ks-pass env:KEYSTORE_PASSWORD --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD             --out "$OUT" aligned.apk || fail "apksigner sign failed (wrong password or alias?)"
           "$BT/apksigner" verify --print-certs "$OUT" | grep -E "SHA-256|Verifies"
           rm -f "$RUNNER_TEMP/release.jks"
           echo "APK_NAME=$OUT" >> "$GITHUB_ENV"
-          echo "RELEASE_TAG=aaps-build-$(date +%Y%m%d-%H%M)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=aaps-${VARIANT}-$(date +%Y%m%d-%H%M)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$RELEASE_TAG" "$APK_NAME" \
-            --target "$GITHUB_SHA" \
-            --title "AAPS 4.0.0-rc1 + source trend arrow (${GITHUB_SHA::7})" \
-            --notes "Signed fork build from ${GITHUB_REF_NAME}, commit ${GITHUB_SHA}. Not an official AAPS build." \
-            --latest
+          LATEST=""
+          [ "$VARIANT" = "fullRelease" ] && LATEST="--latest"
+          gh release create "$RELEASE_TAG" "$APK_NAME"             --target "$GITHUB_SHA"             --title "AAPS 4.0.0-rc1 + source trend arrow, $VARIANT (${GITHUB_SHA::7})"             --notes "Signed fork build ($VARIANT) from ${GITHUB_REF_NAME}, commit ${GITHUB_SHA}. Not an official AAPS build."             $LATEST
 
       - uses: actions/upload-artifact@v4
         with:
