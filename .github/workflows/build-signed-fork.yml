@@ -86,7 +86,7 @@ jobs:
           echo "APK_NAME=$OUT" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=aaps-build-$(date +%Y%m%d-%H%M)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
-      - name: Publish GitHub Release (pre-release)
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -94,7 +94,7 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "AAPS 4.0.0-rc1 + source trend arrow (${GITHUB_SHA::7})" \
             --notes "Signed fork build from ${GITHUB_REF_NAME}, commit ${GITHUB_SHA}. Not an official AAPS build." \
-            --prerelease
+            --latest
 
       - uses: actions/upload-artifact@v4
         with:
