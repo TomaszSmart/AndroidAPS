@@ -346,6 +346,13 @@ class TrendCalculatorImplTest : TestBase() {
         assertThat(trendCalculator.getTrendArrow(autosensDataStore)).isEqualTo(TrendArrow.DOUBLE_DOWN)
     }
 
+    @Test
+    fun `getTrendArrow returns current source arrow even without bucketed data`() {
+        whenever(autosensDataStore.getBucketedDataTableCopy()).thenReturn(null)
+        whenever(autosensDataStore.getBgReadingsDataTableCopy()).thenReturn(listOf(rawReading(System.currentTimeMillis(), TrendArrow.FLAT)))
+        assertThat(trendCalculator.getTrendArrow(autosensDataStore)).isEqualTo(TrendArrow.FLAT)
+    }
+
     private fun rawReading(timestamp: Long, trendArrow: TrendArrow) = GV(
         timestamp = timestamp,
         raw = null,
