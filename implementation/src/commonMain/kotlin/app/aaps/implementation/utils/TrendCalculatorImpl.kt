@@ -1,6 +1,7 @@
 package app.aaps.implementation.utils
 
 import app.aaps.core.data.iob.InMemoryGlucoseValue
+import app.aaps.core.data.model.GV
 import app.aaps.core.data.model.TrendArrow
 import app.aaps.core.interfaces.aps.AutosensDataStore
 import app.aaps.core.interfaces.resources.TextResolver
@@ -29,7 +30,18 @@ class TrendCalculatorImpl(
             else                                            -> calculateDirection(data)
         }
          */
+        // Custom build: show the arrow supplied by the CGM source (e.g. Dexcom, via xDrip) when it is current.
+        // Smoothing plugins clear trendArrow on the bucketed data, so read it from the raw reading.
+        sourceArrow(autosensDataStore.getBgReadingsDataTableCopy(), data[0].timestamp)?.let { return it }
         return calculateDirection(data)
+    }
+
+    /** Arrow of the newest raw reading, if the source provided one and it belongs to the latest bucket. */
+    private fun sourceArrow(readings: List<GV>, latestBucketTimestamp: Long): TrendArrow? {
+        val latest = readings.firstOrNull() ?: return null
+        if (latest.trendArrow == TrendArrow.NONE) return null
+        if (kotlin.math.abs(latest.timestamp - latestBucketTimestamp) > SOURCE_ARROW_MAX_AGE_MS) return null
+        return latest.trendArrow
     }
 
     override fun getTrendDescription(autosensDataStore: AutosensDataStore): String =
@@ -59,5 +71,9 @@ class TrendCalculatorImpl(
             slopeByMinute <= 40   -> TrendArrow.DOUBLE_UP
             else                  -> TrendArrow.NONE
         }
+    }
+
+    private companion object {
+        const val SOURCE_ARROW_MAX_AGE_MS = 10 * 60 * 1000L
     }
 }
