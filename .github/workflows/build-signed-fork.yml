@@ -18,6 +18,11 @@ on:
         options:
           - fullRelease
           - aapsclientRelease
+      sourceTag:
+        description: 'Optional official upstream tag to build instead of this branch (e.g. 3.4.2.6 for AAPSClient). Leave empty for this branch.'
+        required: false
+        default: ''
+        type: string
   push:
     branches: [ native-trend-arrow ]
 
@@ -25,9 +30,11 @@ env:
   JAVA_VERSION: 21
   # push builds have no inputs, they build the full app
   VARIANT: ${{ inputs.variant || 'fullRelease' }}
+  SOURCE_TAG: ${{ inputs.sourceTag || '' }}
 
 jobs:
   trend-arrow-tests:
+    if: ${{ inputs.sourceTag == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -55,8 +62,20 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - run: chmod +x gradlew
 
+      - name: Switch to upstream tag
+        if: ${{ env.SOURCE_TAG != '' }}
+        run: |
+          git fetch --depth=1 https://github.com/nightscout/AndroidAPS.git "refs/tags/$SOURCE_TAG:refs/tags/$SOURCE_TAG"
+          git checkout "refs/tags/$SOURCE_TAG"
+          git log --oneline -1
+
       - name: Build ${{ env.VARIANT }} (unsigned)
-        run: ./gradlew ":app:assemble${VARIANT^}" --stacktrace
+        run: |
+          ARGS=""
+          if [ -n "$SOURCE_TAG" ]; then
+            ARGS="-Dorg.gradle.jvmargs=-Xmx6g -Dkotlin.compiler.execution.strategy=in-process"
+          fi
+          ./gradlew ":app:assemble${VARIANT^}" $ARGS --stacktrace
 
       - name: Locate unsigned APK
         run: |
@@ -90,21 +109,25 @@ jobs:
           echo "SDK=$SDK"; ls "$SDK/build-tools" || fail "no build-tools under $SDK"
           BT="$SDK/build-tools/$(ls "$SDK/build-tools" | sort -V | tail -1)"
           echo "BT=$BT"
-          OUT="AAPS-${VARIANT}-native-trend-arrow-$(date +%Y%m%d)-${GITHUB_SHA::7}.apk"
+          LABEL="${SOURCE_TAG:-native-trend-arrow}"
+          echo "LABEL=$LABEL" >> "$GITHUB_ENV"
+          OUT="AAPS-${VARIANT}-${LABEL}-$(date +%Y%m%d)-${GITHUB_SHA::7}.apk"
           "$BT/zipalign" -p -f 4 "$UNSIGNED_APK" aligned.apk || fail "zipalign failed"
           "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks"             --ks-pass env:KEYSTORE_PASSWORD --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD             --out "$OUT" aligned.apk || fail "apksigner sign failed (wrong password or alias?)"
           "$BT/apksigner" verify --print-certs "$OUT" | grep -E "SHA-256|Verifies"
           rm -f "$RUNNER_TEMP/release.jks"
           echo "APK_NAME=$OUT" >> "$GITHUB_ENV"
-          echo "RELEASE_TAG=aaps-${VARIANT}-$(date +%Y%m%d-%H%M)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=aaps-${VARIANT}-${LABEL}-$(date +%Y%m%d-%H%M)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           LATEST=""
-          [ "$VARIANT" = "fullRelease" ] && LATEST="--latest"
-          gh release create "$RELEASE_TAG" "$APK_NAME"             --target "$GITHUB_SHA"             --title "AAPS 4.0.0-rc1 + source trend arrow, $VARIANT (${GITHUB_SHA::7})"             --notes "Signed fork build ($VARIANT) from ${GITHUB_REF_NAME}, commit ${GITHUB_SHA}. Not an official AAPS build."             $LATEST
+          [ "$VARIANT" = "fullRelease" ] && [ -z "$SOURCE_TAG" ] && LATEST="--latest"
+          TITLE="AAPS 4.0.0-rc1 + source trend arrow, $VARIANT (${GITHUB_SHA::7})"
+          [ -n "$SOURCE_TAG" ] && TITLE="Official AAPS $SOURCE_TAG, $VARIANT, signed with own key"
+          gh release create "$RELEASE_TAG" "$APK_NAME"             --target "$GITHUB_SHA"             --title "$TITLE"             --notes "Signed fork build ($VARIANT, ${LABEL}) from ${GITHUB_REF_NAME}, commit ${GITHUB_SHA}. Not an official AAPS build."             $LATEST
 
       - uses: actions/upload-artifact@v4
         with:
