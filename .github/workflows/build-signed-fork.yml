@@ -47,6 +47,19 @@ jobs:
       - name: Build full release (unsigned)
         run: ./gradlew :app:assembleFullRelease --stacktrace
 
+      - name: Locate unsigned APK
+        run: |
+          IN=$(find app/build/outputs -name '*.apk' | head -1)
+          echo "Found APKs:"; find app/build/outputs -name '*.apk' -exec ls -l {} \;
+          if [ -z "$IN" ]; then echo "::error::No APK found under app/build/outputs"; exit 1; fi
+          echo "UNSIGNED_APK=$IN" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-apk
+          path: ${{ env.UNSIGNED_APK }}
+          retention-days: 7
+
       - name: Sign APK
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -54,20 +67,21 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "::error::Secret KEYSTORE_BASE64 is missing - see the header of this workflow file"
-            exit 1
-          fi
-          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
-          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
-          IN=$(find app/build/outputs/apk/full/release -name '*.apk' | head -1)
-          echo "Input APK: $IN"
+          fail() { echo "::error::$1"; exit 1; }
+          [ -n "$KEYSTORE_BASE64" ] || fail "Secret KEYSTORE_BASE64 is missing"
+          [ -n "$KEYSTORE_PASSWORD" ] || fail "Secret KEYSTORE_PASSWORD is missing"
+          [ -n "$KEY_ALIAS" ] || fail "Secret KEY_ALIAS is missing"
+          [ -n "$KEY_PASSWORD" ] || fail "Secret KEY_PASSWORD is missing"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks" || fail "KEYSTORE_BASE64 is not valid base64"
+          echo "keystore size: $(stat -c %s "$RUNNER_TEMP/release.jks") bytes"
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "SDK=$SDK"; ls "$SDK/build-tools" || fail "no build-tools under $SDK"
+          BT="$SDK/build-tools/$(ls "$SDK/build-tools" | sort -V | tail -1)"
+          echo "BT=$BT"
           OUT="AAPS-native-trend-arrow-$(date +%Y%m%d)-${GITHUB_SHA::7}.apk"
-          "$BT/zipalign" -p -f 4 "$IN" aligned.apk
-          "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks" \
-            --ks-pass env:KEYSTORE_PASSWORD --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD \
-            --out "$OUT" aligned.apk
-          "$BT/apksigner" verify --print-certs "$OUT"
+          "$BT/zipalign" -p -f 4 "$UNSIGNED_APK" aligned.apk || fail "zipalign failed"
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks"             --ks-pass env:KEYSTORE_PASSWORD --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD             --out "$OUT" aligned.apk || fail "apksigner sign failed (wrong password or alias?)"
+          "$BT/apksigner" verify --print-certs "$OUT" | grep -E "SHA-256|Verifies"
           rm -f "$RUNNER_TEMP/release.jks"
           echo "APK_NAME=$OUT" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=aaps-build-$(date +%Y%m%d-%H%M)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
