@@ -71,12 +71,8 @@ jobs:
 
       - name: Build ${{ env.VARIANT }} (unsigned)
         run: |
-          if [ -n "$SOURCE_TAG" ]; then
-            ARGS=("-Dorg.gradle.jvmargs=-Xmx6g" "-Dkotlin.compiler.execution.strategy=in-process")
-          else
-            # same memory settings as the upstream aaps-ci.yml: the 4.0.0 app is too big for the repo defaults on a 16 GB runner
-            ARGS=("-Dorg.gradle.jvmargs=-Xmx8g -XX:+UseParallelGC -Xss4m" "-Dkotlin.daemon.jvm.options=-Xmx2g" "-Dkotlin.compiler.execution.strategy=in-process" "-Dorg.gradle.workers.max=4")
-          fi
+          # same memory settings as the upstream aaps-ci.yml (branch and tag builds): the 4.0.0 code is too big for the repo defaults on a 16 GB runner
+          ARGS=("-Dorg.gradle.jvmargs=-Xmx8g -XX:+UseParallelGC -Xss4m" "-Dkotlin.daemon.jvm.options=-Xmx2g" "-Dkotlin.compiler.execution.strategy=in-process" "-Dorg.gradle.workers.max=4")
           ./gradlew ":app:assemble${VARIANT^}" "${ARGS[@]}" --stacktrace
 
       - name: Locate unsigned APK
