@@ -18,8 +18,16 @@ on:
         options:
           - fullRelease
           - aapsclientRelease
+      module:
+        description: 'What to build: app = the phone app, wear = the Wear OS watch app of the chosen variant (signed with the same key)'
+        required: true
+        default: 'app'
+        type: choice
+        options:
+          - app
+          - wear
       sourceTag:
-        description: 'Optional official upstream tag to build instead of this branch (e.g. 3.4.2.6 for AAPSClient). Leave empty for this branch.'
+        description: 'Optional official upstream tag to build instead of this branch (e.g. 3.4.2.6 for AAPSClient, 4.0.0 for the official wear app). Leave empty for this branch.'
         required: false
         default: ''
         type: string
@@ -30,11 +38,12 @@ env:
   JAVA_VERSION: 21
   # push builds have no inputs, they build the full app
   VARIANT: ${{ inputs.variant || 'fullRelease' }}
+  MODULE: ${{ inputs.module || 'app' }}
   SOURCE_TAG: ${{ inputs.sourceTag || '' }}
 
 jobs:
   trend-arrow-tests:
-    if: ${{ inputs.sourceTag == '' }}
+    if: ${{ inputs.sourceTag == '' && inputs.module != 'wear' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -69,25 +78,23 @@ jobs:
           git checkout "refs/tags/$SOURCE_TAG"
           git log --oneline -1
 
-      - name: Build ${{ env.VARIANT }} (unsigned)
+      - name: Build ${{ env.MODULE }} ${{ env.VARIANT }} (unsigned)
         run: |
-          ARGS=""
-          if [ -n "$SOURCE_TAG" ]; then
-            ARGS="-Dorg.gradle.jvmargs=-Xmx6g -Dkotlin.compiler.execution.strategy=in-process"
-          fi
-          ./gradlew ":app:assemble${VARIANT^}" $ARGS --stacktrace
+          # same memory settings as the upstream aaps-ci.yml (branch and tag builds): the 4.0.0 code is too big for the repo defaults on a 16 GB runner
+          ARGS=("-Dorg.gradle.jvmargs=-Xmx8g -XX:+UseParallelGC -Xss4m" "-Dkotlin.daemon.jvm.options=-Xmx2g" "-Dkotlin.compiler.execution.strategy=in-process" "-Dorg.gradle.workers.max=4")
+          ./gradlew ":${MODULE}:assemble${VARIANT^}" "${ARGS[@]}" --stacktrace
 
       - name: Locate unsigned APK
         run: |
           FLAVOR=$(echo "$VARIANT" | sed -E 's/(Release|Debug)$//' | tr '[:upper:]' '[:lower:]')
-          IN=$(find "app/build/outputs/apk/$FLAVOR" -name '*.apk' | head -1)
-          echo "Found APKs:"; find app/build/outputs -name '*.apk' -exec ls -l {} \;
-          if [ -z "$IN" ]; then echo "::error::No APK found for variant $VARIANT"; exit 1; fi
+          IN=$(find "$MODULE/build/outputs/apk/$FLAVOR" -name '*.apk' | head -1)
+          echo "Found APKs:"; find "$MODULE/build/outputs" -name '*.apk' -exec ls -l {} \;
+          if [ -z "$IN" ]; then echo "::error::No APK found for $MODULE $VARIANT"; exit 1; fi
           echo "UNSIGNED_APK=$IN" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: unsigned-apk-${{ env.VARIANT }}
+          name: unsigned-apk-${{ env.MODULE }}-${{ env.VARIANT }}
           path: ${{ env.UNSIGNED_APK }}
           retention-days: 1
 
@@ -111,7 +118,8 @@ jobs:
           echo "BT=$BT"
           LABEL="${SOURCE_TAG:-native-trend-arrow}"
           echo "LABEL=$LABEL" >> "$GITHUB_ENV"
-          OUT="AAPS-${VARIANT}-${LABEL}-$(date +%Y%m%d)-${GITHUB_SHA::7}.apk"
+          PREFIX="AAPS"; [ "$MODULE" = "wear" ] && PREFIX="AAPS-wear"
+          OUT="${PREFIX}-${VARIANT}-${LABEL}-$(date +%Y%m%d)-${GITHUB_SHA::7}.apk"
           "$BT/zipalign" -p -f 4 "$UNSIGNED_APK" aligned.apk || fail "zipalign failed"
           "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks"             --ks-pass env:KEYSTORE_PASSWORD --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD             --out "$OUT" aligned.apk || fail "apksigner sign failed (wrong password or alias?)"
           "$BT/apksigner" verify --print-certs "$OUT" | grep -E "SHA-256|Verifies"
