@@ -1,8 +1,14 @@
 package app.aaps.ios.shell.ui
 
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
@@ -14,6 +20,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.window.ComposeUIViewController
@@ -30,12 +37,14 @@ import app.aaps.appshell.navigation.appNavGraph
 import app.aaps.appshell.navigation.handleNotificationAction
 import app.aaps.appshell.navigation.handleQuickLaunchAction
 import app.aaps.appshell.navigation.handleSearchResultClick
+import app.aaps.core.interfaces.configuration.Config
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
 import app.aaps.core.interfaces.notifications.IosNotificationDelegate
 import app.aaps.core.interfaces.protection.ProtectionCheck
 import app.aaps.core.interfaces.protection.ProtectionResult
 import app.aaps.core.interfaces.resources.TextRefValueRegistry
+import app.aaps.core.interfaces.utils.fabric.CrashReporter
 import app.aaps.core.keys.BooleanNonKey
 import app.aaps.core.keys.StringKey
 import app.aaps.core.objects.di.CoreObjectsGraph
@@ -46,14 +55,20 @@ import app.aaps.core.ui.compose.icons.IcAaps
 import app.aaps.core.ui.compose.metroViewModel
 import app.aaps.core.ui.compose.rememberOwnViewModelStoreOwner
 import app.aaps.core.ui.compose.stringResource
+import app.aaps.core.utils.gitRemoteShort
 import app.aaps.implementation.lifecycle.IosProtectionLifecycle
+import app.aaps.implementation.receivers.IosTimeDateOrTZChangeWatcher
+import app.aaps.implementation.logging.AAPSLoggerIos
+import app.aaps.implementation.protection.IosBiometricPrompt
 import app.aaps.implementation.protection.KeychainUnavailableException
+import app.aaps.implementation.protection.LocalAuthenticationEvaluator
 import app.aaps.ios.shell.IosAppStartup
 import app.aaps.ios.shell.PluginStoreRegistry
 import app.aaps.ios.shell.di.IosAppGraph
 import app.aaps.ios.shell.platform.IosLanguage
 import app.aaps.ios.shell.platform.notOnThisPlatform
 import app.aaps.ios.shell.prefs.IosStorage
+import app.aaps.plugins.sync.nsclientV3.ws.IosForegroundWatcher
 import app.aaps.plugins.sync.nsclientV3.ws.NsSocketFactory
 import app.aaps.shared.clientbindings.ClientGraphBindings
 import app.aaps.shared.clientbindings.ClientViewModelFactory
@@ -83,11 +98,14 @@ import app.aaps.ui.compose.treatments.viewmodels.TreatmentsViewModel
 import app.aaps.ui.compose.treatmentsSheet.TreatmentViewModel
 import app.aaps.ui.search.SearchViewModel
 import dev.zacsweers.metro.createGraphFactory
+import kotlin.experimental.ExperimentalNativeApi
+import kotlin.native.setUnhandledExceptionHook
+import kotlin.native.terminateWithUnhandledException
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import platform.Foundation.NSNotificationCenter
 import platform.Foundation.NSOperationQueue
-import platform.UIKit.UIApplicationDidBecomeActiveNotification
+import platform.UIKit.UIApplicationWillEnterForegroundNotification
 import platform.UIKit.UIApplicationDidEnterBackgroundNotification
 import platform.UIKit.UIViewController
 
@@ -114,8 +132,9 @@ import platform.UIKit.UIViewController
  * platform is supposed to supply - opening a document picker, asking for a permission - and each
  * needs an iOS answer of its own rather than a shared one.
  */
-fun aapsAppViewController(nsSocketFactory: NsSocketFactory): UIViewController {
-    val startup = runCatching { startApp(nsSocketFactory) }
+fun aapsAppViewController(nsSocketFactory: NsSocketFactory, crashReporter: CrashReporter): UIViewController {
+    installCrashLogging()
+    val startup = runCatching { startApp(nsSocketFactory, crashReporter) }
     return ComposeUIViewController {
         // State, because "Start fresh" and "Try again" on the failure screen start the app a second time
         // in place. iOS gives an app no way to restart itself.
@@ -129,11 +148,11 @@ fun aapsAppViewController(nsSocketFactory: NsSocketFactory): UIViewController {
                         explanation = failureExplanation(error),
                         error = error,
                         // A failure of either one lands on this same screen again.
-                        onRetry = if (error is KeychainUnavailableException) ({ current = runCatching { startApp(nsSocketFactory) } }) else null,
+                        onRetry = if (error is KeychainUnavailableException) ({ current = runCatching { startApp(nsSocketFactory, crashReporter) } }) else null,
                         onStartFresh = if (error is StoreUnreadableException) ({
                             current = runCatching {
                                 IosStorage.startFresh()
-                                startApp(nsSocketFactory)
+                                startApp(nsSocketFactory, crashReporter)
                             }
                         }) else null
                     )
@@ -141,6 +160,65 @@ fun aapsAppViewController(nsSocketFactory: NsSocketFactory): UIViewController {
             }
         )
     }
+}
+
+/** Set once. [aapsAppViewController] is called once by Swift, but a second call must not add a second hook. */
+private var crashLoggingInstalled = false
+
+/**
+ * Writes the exception that is about to stop the app into `aaps.log`.
+ *
+ * An uncaught Kotlin exception on iOS ends in `abort()`, so the process dies with SIGABRT. The crash
+ * report iOS keeps afterwards holds the whole Kotlin stack, frame by frame - but not the exception
+ * **type or message**. Kotlin prints those to stdout and stderr, and nothing on a phone records
+ * either. A real crash of this app on 2026-10-25 left 49 readable frames in the system report and
+ * not one line in the app's own log, so the only question anybody actually asks - what went wrong -
+ * was the one thing missing.
+ *
+ * This hook writes the type, the message and the stack to the file the "Send logs" button shares,
+ * and then ends the process the way the runtime would have.
+ *
+ * Installed here rather than inside [startApp], which runs again for "Try again" and "Start fresh".
+ *
+ * The logger is built here instead of taken from the graph on purpose: when this runs the graph may
+ * be half built, or already gone, and a crash reporter that needs a working app is no use.
+ */
+@OptIn(ExperimentalNativeApi::class)
+private fun installCrashLogging() {
+    if (crashLoggingInstalled) return
+    crashLoggingInstalled = true
+    val logger = AAPSLoggerIos()
+    setUnhandledExceptionHook { throwable ->
+        // Nothing in here may throw. A failure inside the hook replaces a readable crash with a
+        // confusing one, and the process still has to end either way.
+        runCatching { logger.error(LTag.CORE, "Uncaught exception, the app is stopping", throwable) }
+        terminateWithUnhandledException(throwable)
+    }
+}
+
+/**
+ * Tells Crashlytics which build this is - the same six keys Android has sent since 2019.
+ *
+ * Without them one report looks like any other. The version in the Crashlytics header comes from
+ * the app bundle, and a clone that has never run `generateIosVersionXcconfig` falls back to the
+ * version typed into the targets with build number 1 - so one person building two hundred times
+ * is indistinguishable from two hundred users. These keys carry the truth instead: the commit,
+ * the repository and whether the tree was clean, which is how a report out of a fork is told
+ * apart from one from upstream.
+ *
+ * Set whether or not collection is on. Nothing leaves the device while it is off, because
+ * Crashlytics writes no report at all then, and setting them unconditionally means a user who turns
+ * reporting on later in the session does not get unlabelled reports until the next launch. A build
+ * with no Firebase config ignores all of this: `CrashlyticsCrashReporter` returns early when it was
+ * never configured, and `NoCrashReporter` does nothing at all.
+ */
+internal fun setBuildIdentityKeys(crashReporter: CrashReporter, config: Config) {
+    crashReporter.setCustomKey("HEAD", config.HEAD)
+    crashReporter.setCustomKey("Version", config.VERSION_NAME)
+    crashReporter.setCustomKey("BuildType", config.BUILD_TYPE)
+    crashReporter.setCustomKey("BuildFlavor", config.FLAVOR)
+    crashReporter.setCustomKey("Remote", gitRemoteShort(config.REMOTE))
+    crashReporter.setCustomKey("Committed", config.COMMITTED.toString())
 }
 
 /** The app, built and started: what the composition needs from outside it. */
@@ -159,17 +237,46 @@ private class StartedApp(
  * message, which the failure screen can act on, instead of failing somewhere inside the first screen.
  * And so that the screen can call this again.
  */
-private fun startApp(nsSocketFactory: NsSocketFactory): StartedApp {
+private fun startApp(nsSocketFactory: NsSocketFactory, crashReporter: CrashReporter): StartedApp {
     val store = IosStorage.open()
     // Built once, outside the composition: a graph rebuilt on each recomposition would hand out new
     // singletons every frame - a new database wrapper, a new preference store.
-    val graph = createGraphFactory<IosAppGraph.Factory>().create(CoreObjectsGraph, ClientGraphBindings, nsSocketFactory)
+    val graph = createGraphFactory<IosAppGraph.Factory>().create(CoreObjectsGraph, ClientGraphBindings, nsSocketFactory, crashReporter)
     val viewModelFactory = ClientViewModelFactory(graph)
     val logger = graph.logger
 
+    // Tell Crashlytics the stored answer before anything can crash. Its own signal handler catches a
+    // fatal crash whether or not Kotlin calls it, so gating the call sites alone would cover the
+    // non-fatals and silently miss the crashes. Pushed here rather than from the reporter's own
+    // constructor, which runs whenever something first injects it - possibly never, possibly late.
+    //
+    // Asked through `fabricEnabled()`, not `preferences.get`: this key is `defaultedBySM`, so
+    // `PreferencesImpl` answers the shared default - true - in Simple Mode, which would switch
+    // collection on for precisely the users whose settings screen never shows them the row.
+    crashReporter.setCollectionEnabled(graph.fabricPrivacy.fabricEnabled())
+    setBuildIdentityKeys(crashReporter, graph.config)
+
     // Before the composition, not beside it: the first view model built reads the active pump, and
     // an empty plugin list there throws from a coroutine and takes the process with it.
-    IosAppStartup(logger, PluginStoreRegistry(graph.pluginStore, graph.configBuilder), graph.contributedPlugins) { graph.periodicMaintenance.start(graph.appScope) }.run()
+    IosAppStartup(
+        logger,
+        PluginStoreRegistry(graph.pluginStore, graph.configBuilder),
+        graph.contributedPlugins,
+        graph.rxBus,
+        graph.appScope,
+        startPeriodicWork = {
+            // Android does this in `MainApp`, next to scheduling `KeepAliveWorker`; this shell never
+            // did. `PeriodicMaintenance.start` runs its first pass straight away, and that pass asks
+            // whether the newest stored glucose value is stale. On a cold start it always is, by
+            // however long the app was not running - which on iOS is every launch, because the
+            // process is suspended rather than kept alive. The pre-snooze holds the alarm back for
+            // five minutes so the first Nightscout round can land first. Without it the app raises
+            // "BG readings missed" while Nightscout has the data (nightscout/AndroidAPS#5495).
+            graph.localAlertUtils.preSnoozeAlarms()
+            graph.periodicMaintenance.start(graph.appScope)
+        },
+        startAutomation = { graph.automationRuntime.start() }
+    ).run()
 
     // Attach to the notification centre. Registering a category only records it now, so that building
     // the graph does not need an app bundle - see `IosNotificationDelegate.install`. It is done here
@@ -197,6 +304,11 @@ private fun startApp(nsSocketFactory: NsSocketFactory): StartedApp {
     // gets from `ProcessLifecycleListener.onPause`. Same placement and the same UIKit reason.
     IosProtectionLifecycle(logger, graph.protectionCheck).start()
 
+    // Sends EventTimeZoneChanged and tells the pump driver, which is what Android gets from
+    // `TimeDateOrTZChangeReceiver`. Without it a flight left the IOB of the last hours calculated in
+    // the old zone. Same placement: it attaches to the notification centre.
+    IosTimeDateOrTZChangeWatcher(logger, graph.activePlugin, graph.appScope, graph.rxBus).start()
+
     // Read once, outside the composition, for the same reason as the graph: decoding the icon on
     // every recomposition would be work for nothing.
     // From the bundle, like the icon and for the same reason: one framework serves both AAPSClient
@@ -215,6 +327,29 @@ private fun startApp(nsSocketFactory: NsSocketFactory): StartedApp {
         queue = NSOperationQueue.mainQueue,
         usingBlock = { store.flush() }
     )
+
+    // The other half of the same problem. iOS suspends the process, and the websocket comes back
+    // looking connected while delivering nothing, so no catch-up round is ever started and the
+    // screen keeps showing the glucose value from before the suspension. Replacing the connection
+    // is what starts that round. The pre-snooze goes first, so the maintenance pass that resumes
+    // with the app cannot raise "BG readings missed" in the seconds before the round lands - the
+    // same five minutes a cold start gets (nightscout/AndroidAPS#5495).
+    //
+    // Owned by the process and never stopped, like the observer above: it has to outlive a UI
+    // restart, which rebuilds everything inside the composition. "Try again" and "Start fresh" on
+    // the failure screen call `startApp` a second time, but cannot leave two watchers behind: every
+    // failure that screen handles is thrown while the store and the graph are built, far above this
+    // line, so a run that reaches here is the only run that registers anything.
+    IosForegroundWatcher(
+        aapsLogger = logger,
+        onResumeAfterGap = { awayMs ->
+            logger.debug(LTag.CORE, "Away for ${awayMs / 1000}s, replacing the Nightscout connection")
+            graph.localAlertUtils.preSnoozeAlarms()
+            graph.nsConnection.stop()
+            graph.nsConnection.start("resume")
+        }
+    ).start()
+
     return StartedApp(graph, viewModelFactory, appName, appIcon)
 }
 
@@ -244,6 +379,10 @@ private fun AapsApp(app: StartedApp) {
     // beside the language effect because both are app wide settings applied while it runs.
     KeepScreenOnEffect(graph.preferences)
 
+    // One prompt for the whole app, like the single `BiometricCheck` call Android makes. Held across
+    // recompositions because `LAContext` is built per evaluation inside it, not here.
+    val biometricPrompt = remember { IosBiometricPrompt(LocalAuthenticationEvaluator(), logger) }
+
     val restart by graph.uiRestart.signal.collectAsState()
     key(restart) {
     // iOS has no ambient application object, so the factory is provided here rather than found.
@@ -261,6 +400,19 @@ private fun AapsApp(app: StartedApp) {
             passwordHasher = graph.passwordHasher,
             passwordCheck = graph.passwordCheck,
             protectionCheck = graph.protectionCheck,
+            // The one platform-specific part of protection, exactly as `ComposeMainActivity` passes
+            // its `BiometricCheck` one. Without it the host falls back to its own default, which
+            // answers "use the password" at once, so Face ID was never shown and application
+            // protection could not be satisfied (nightscout/AndroidAPS#5520).
+            showBiometricSimple = { title, onSuccess, onFallback, onCancel ->
+                biometricPrompt.show(
+                    title = title,
+                    fallbackTitle = graph.textResolver.gs(CoreUiStrings.use_pin_password),
+                    onSuccess = onSuccess,
+                    onFallback = onFallback,
+                    onCancel = onCancel
+                )
+            },
             exportPasswordDataStore = graph.exportPasswordDataStore,
             visibilityContext = graph.visibilityContext,
             nsClient = graph.nsClient,
@@ -282,11 +434,21 @@ private fun AapsApp(app: StartedApp) {
             // has no request to render and a configured app-launch password never appears - the
             // setting looked saved and did nothing, which is how it was found.
             //
-            // Asked at launch **and every time the app comes back to the foreground**, which is
+            // Asked at launch **and every time the app comes back from the background**, which is
             // the case that matters: a phone handed to someone else while AAPS is backgrounded.
             // Android does the same from `onResume`. When protection is set to "No protection"
             // this costs nothing - `requestProtection` grants straight away without a dialog, so
             // the gate only appears for someone who asked for it.
+            //
+            // `WillEnterForeground` and **not** `DidBecomeActive`, which this used to listen to.
+            // `DidBecomeActive` also fires when a system sheet closes, and the Face ID sheet is a
+            // system sheet - so asking for Face ID re-locked the app the moment the scan succeeded
+            // and the sheet went away, for ever (nightscout/AndroidAPS#5520). Control centre and
+            // the notification shade did the same. Android does not see this because
+            // `BiometricPrompt` is an overlay that never pauses the activity, so `onResume` does
+            // not fire when it closes. `WillEnterForeground` fires only on a real return from the
+            // background, which is what `onResume` means here, and it pairs with
+            // `IosProtectionLifecycle`, which clears the authorization on `DidEnterBackground`.
             var unlocked by remember { mutableStateOf(false) }
             var asking by remember { mutableStateOf(false) }
             val requestUnlock = remember {
@@ -311,7 +473,7 @@ private fun AapsApp(app: StartedApp) {
             DisposableEffect(Unit) {
                 requestUnlock()
                 val observer = NSNotificationCenter.defaultCenter.addObserverForName(
-                    name = UIApplicationDidBecomeActiveNotification,
+                    name = UIApplicationWillEnterForegroundNotification,
                     `object` = null,
                     queue = NSOperationQueue.mainQueue,
                     usingBlock = { requestUnlock() }
@@ -322,7 +484,10 @@ private fun AapsApp(app: StartedApp) {
             // Nothing is drawn until it is granted. Showing the app behind the prompt would make
             // the protection cosmetic - the screen it is meant to hide would be readable through
             // the dialog, and on iOS it would also be in the app-switcher snapshot.
-            if (!unlocked) return@AapsAppRoot
+            if (!unlocked) {
+                AppLockedScreen(showRetry = !asking, onRetry = requestUnlock)
+                return@AapsAppRoot
+            }
 
             // Everything the shared screens ask a platform for that iOS cannot answer ends up in
             // one of these two. Until now they only wrote a line in the log, so from the user's
@@ -432,11 +597,18 @@ private fun AapsApp(app: StartedApp) {
                     rxBus = graph.rxBus,
                     activePlugin = graph.activePlugin,
                     pluginPermissions = graph.pluginPermissions,
-                    // Passed so the rules can be read and edited here. The runtime is deliberately
-                    // NOT started on a client: `MainApp` calls `automationRuntime.start()`, this shell
-                    // does not, and that is the design - a follower edits definitions and the master
-                    // runs them. Do not "fix" the missing start() call; it would give a second machine
-                    // the power to fire the same rules.
+                    // Passed so the rules can be read and edited here. A follower edits definitions
+                    // and the master runs them - and `start()` is what the follower needs to do its
+                    // half: it loads the rules and keeps them in step with the master. `IosAppStartup`
+                    // calls it, as `MainApp` does on every flavour.
+                    //
+                    // This does not give this phone the power to fire anything. `start()` returns
+                    // before the processing loop when `config.APS` is false, and `runEvent` - the one
+                    // place in the runtime that runs an action - refuses on the same flag, which also
+                    // covers the wear tile, quick launch, scenes and run-now. `executionEnabled` hides
+                    // the Run button here as well. An earlier comment in this spot said the missing
+                    // `start()` was the design and warned against calling it; it was not - the rule
+                    // list was simply always empty on iOS and desktop.
                     automationRuntime = graph.automationRuntime,
                     preferences = graph.preferences,
                     rh = graph.textResolver,
@@ -490,7 +662,6 @@ private fun AapsApp(app: StartedApp) {
                             commandQueue = graph.commandQueue,
                             pumpCommunicationStatus = graph.pumpCommunicationStatus,
                             appName = appName,
-                            authorizationFailedMessage = "Authorization failed",
                             onNavigate = { request -> navigator.handleNavigationRequest(request) },
                             onSearchResultClick = { entry -> navigator.handleSearchResultClick(entry) },
                             onNotificationActionClick = { n -> navigator.handleNotificationAction(n.id) },
@@ -522,7 +693,6 @@ private fun AapsApp(app: StartedApp) {
                             onBringToForeground = { graph.authBrowser.dismiss() },
                             // No activity to recreate. A Compose scene is not restarted this way.
                             onRecreateActivity = { logger.debug(LTag.CORE, "Nothing to recreate on iOS after a database reset") },
-                            onAuthorizationFailed = { logger.error(LTag.CORE, "Authorization failed") },
                             autoShowNotificationSheet = false,
                             onAutoShowConsumed = {}
                         )
@@ -543,6 +713,27 @@ private fun AAPSLogger.notWiredYet(what: String) = error(LTag.CORE, "Not wired u
  * A fallback rather than nothing on screen: the About dialog and the drawer both have a place for
  * it, and an empty space there reads as a broken screen.
  */
+/**
+ * What is shown instead of the app while it is locked. An iOS app should not close itself, so after a
+ * refusal the user needs a way to ask again: a blank screen looks like a broken app.
+ */
+@Composable
+private fun AppLockedScreen(showRetry: Boolean, onRetry: () -> Unit) {
+    Surface(Modifier.fillMaxSize()) {
+        // While the prompt is up, it says everything already
+        if (showRetry) {
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(stringResource(CoreUiStrings.biometric_title), style = MaterialTheme.typography.titleLarge)
+                TextButton(onClick = onRetry) { Text(stringResource(CoreUiStrings.retry)) }
+            }
+        }
+    }
+}
+
 @Composable
 private fun AppIconImage(icon: ImageBitmap?, modifier: Modifier) {
     if (icon != null) Image(bitmap = icon, contentDescription = null, modifier = modifier)

@@ -1071,7 +1071,8 @@ Both cost a false alarm today, so they are worth writing down even though neithe
 
 - `SerialIOThreadTest.testThreadLifecycle` (`:pump:dana:danar`, unit) failed one full gate run and passed
   the four runs after it, on a tree whose only changes were iOS files.
-- `EquilEmulatorActivationTest.activatedPod_readsCancelsAndTogglesMode` (instrumented, CI shard C)
+- `EquilEmulatorActivationTest.activatedPod_readsCancelsAndTogglesMode` (instrumented, CI shard C; the
+  class was removed 2026-11-08, its checks are in `EquilScenarioTest` and `EquilUiTest`)
   failed on a push whose only non-desktop change was a markdown file and a test moving between source
   sets. Build 41072 on `kmp` failed the DanaRS instrumented shard the same way, on an About-dialog
   commit.
@@ -1121,7 +1122,7 @@ UI to act on. The prompting lives in `ProtectionHost`, which is a different ques
 
 **The trap: moving the impl alone would make iOS worse, not better.** `IosProtectionCheck` currently
 grants everything, which is wrong but at least passable while iOS reaches no pump. The real impl
-publishes to `pendingRequest` / `pendingAuthRequest` and waits for a host to call back. `AapsAppRoot`
+publishes to `pendingAuthRequest` and waits for a host to call back. `AapsAppRoot`
 places `PasswordCheckHost` but **not** `ProtectionHost` - only `ComposeMainActivity` does. So on iOS
 the request would be published, nothing would render it, and the callback would never fire: every
 protected action would hang rather than be granted or refused. That is worse than either.
